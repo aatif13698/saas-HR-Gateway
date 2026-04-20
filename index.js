@@ -44,7 +44,7 @@ async function connectToDevice() {
     isConnected = false;
     console.error(`❌ Connection failed to ${DEVICE_IP}:4370`);
     console.error(`   Error: ${err.message}`);
-    setTimeout(connectToDevice, 10000);
+    // setTimeout(connectToDevice, 10000);
   }
 }
 
@@ -91,8 +91,8 @@ app.get('/health', (req, res) => res.json({ status: 'ok', connected: isConnected
 
 // Start
 // connectToDevice();
-setTimeout(fullHistoricalSync, 20000);
-cron.schedule('*/30 * * * *', fullHistoricalSync);
+// setTimeout(fullHistoricalSync, 20000);
+// cron.schedule('*/30 * * * *', fullHistoricalSync);
 
 app.listen(5005, () => {
   console.log('🚀 Gateway running on port 5005');
