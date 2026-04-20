@@ -1,4 +1,5 @@
-// index.js  (Gateway)
+
+
 require('dotenv').config();
 const Zkteco = require('zkteco-js');
 const axios = require('axios');
@@ -19,49 +20,59 @@ let isConnected = false;
 console.log(`🚀 Gateway starting... Targeting device: ${DEVICE_IP}`);
 
 async function connectToDevice() {
-  device = new Zkteco(DEVICE_IP, 4370, 10000, 4000);   // ← Correct parameters
+  // Correct parameters for SilkBio-101TC
+  device = new Zkteco(DEVICE_IP, 4370, 15000, 0);   // timeout + password=0
 
-  console.log("device", device);
   
 
   try {
-    console.log(`🔌 Connecting to ${DEVICE_IP}:4370 ...`);
+    console.log(`🔌 Attempting connection to ${DEVICE_IP}:4370 ...`);
     await device.createSocket();
-    await new Promise(r => setTimeout(r, 1500));   // small delay needed
+    await new Promise(r => setTimeout(r, 2000));   // extra delay for ESSL
 
     isConnected = true;
-    console.log(`✅ SUCCESS: Connected to SilkBio-101TC`);
+
+  console.log("device", device);
+
+    console.log(`✅ SUCCESS: Connected to SilkBio-101TC at ${DEVICE_IP}`);
+
+    const name = await device.getDeviceName();
+
+    console.log("name", name);
+    
 
     // Real-time listener
     await device.getRealTimeLogs(async (log) => {
-      console.log('📍 Real-time punch:', log);
-      await sendToCloud(log, 'real-time');
+      console.log('📍 Real-time punch received:', log);
+      // await sendToCloud(log, 'real-time');
     });
 
   } catch (err) {
-    console.log("err", err);
-    
     isConnected = false;
     console.error(`❌ Connection failed to ${DEVICE_IP}:4370`);
-    console.error(`   Error: ${err.message}`);
-    // setTimeout(connectToDevice, 10000);
+    console.error(`   Full Error:`, err);
+    console.error(`   Hint: Make sure ADMS/Cloud Server is OFF on the device`);
+    setTimeout(connectToDevice, 10000);
   }
 }
 
 async function sendToCloud(log, source) {
   try {
-    await axios.post(`${CLOUD_URL}/api/attendance/push`, {
-      tenantId: TENANT_ID,
-      deviceSN: DEVICE_SN,
-      employeeCode: log.userId,
-      punchTime: log.attTime,
-      verifyMode: log.verifyMode,
-      inOutStatus: log.inOutMode,
-      source: source
-    }, {
-      headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
-      timeout: 10000
-    });
+    // console.log("log", log);
+    // console.log("source", source);
+    
+    // await axios.post(`${CLOUD_URL}/api/attendance/push`, {
+    //   tenantId: TENANT_ID,
+    //   deviceSN: DEVICE_SN,
+    //   employeeCode: log.userId,
+    //   punchTime: log.attTime,
+    //   verifyMode: log.verifyMode,
+    //   inOutStatus: log.inOutMode,
+    //   source: source
+    // }, {
+    //   headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
+    //   timeout: 10000
+    // });
   } catch (err) {
     console.error('❌ Cloud push failed:', err.message);
   }
@@ -94,9 +105,7 @@ connectToDevice();
 setTimeout(fullHistoricalSync, 20000);
 cron.schedule('*/30 * * * *', fullHistoricalSync);
 
-app.listen(8080, () => {
+app.listen(5005, () => {
   console.log('🚀 Gateway running on port 5005');
   console.log(`📡 Cloud URL: ${CLOUD_URL}`);
 });
-
-// testing
