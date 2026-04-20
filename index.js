@@ -58,8 +58,8 @@ async function connectToDevice() {
 
 async function sendToCloud(log, source) {
   try {
-    // console.log("log", log);
-    // console.log("source", source);
+    console.log("log", log);
+    console.log("source", source);
     
     // await axios.post(`${CLOUD_URL}/api/attendance/push`, {
     //   tenantId: TENANT_ID,
