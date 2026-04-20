@@ -94,7 +94,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', connected: isConnected
 // setTimeout(fullHistoricalSync, 20000);
 // cron.schedule('*/30 * * * *', fullHistoricalSync);
 
-app.listen(5005, () => {
+app.listen(8080, () => {
   console.log('🚀 Gateway running on port 5005');
   console.log(`📡 Cloud URL: ${CLOUD_URL}`);
 });
