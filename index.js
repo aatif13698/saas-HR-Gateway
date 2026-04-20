@@ -90,9 +90,9 @@ app.post('/sync-full', (req, res) => { fullHistoricalSync(); res.json({ status: 
 app.get('/health', (req, res) => res.json({ status: 'ok', connected: isConnected, deviceIP: DEVICE_IP }));
 
 // Start
-// connectToDevice();
-// setTimeout(fullHistoricalSync, 20000);
-// cron.schedule('*/30 * * * *', fullHistoricalSync);
+connectToDevice();
+setTimeout(fullHistoricalSync, 20000);
+cron.schedule('*/30 * * * *', fullHistoricalSync);
 
 app.listen(8080, () => {
   console.log('🚀 Gateway running on port 5005');
