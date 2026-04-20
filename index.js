@@ -90,7 +90,7 @@ app.post('/sync-full', (req, res) => { fullHistoricalSync(); res.json({ status: 
 app.get('/health', (req, res) => res.json({ status: 'ok', connected: isConnected, deviceIP: DEVICE_IP }));
 
 // Start
-connectToDevice();
+// connectToDevice();
 setTimeout(fullHistoricalSync, 20000);
 cron.schedule('*/30 * * * *', fullHistoricalSync);
 
