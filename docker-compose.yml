@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  essl-gateway:
+    build: .
+    container_name: essl-gateway
+    restart: unless-stopped          # ← This is the key line
+    env_file: .env
+    network_mode: host               # Important for local network access to device
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
