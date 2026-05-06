@@ -89,6 +89,7 @@ async function sendToCloud(logs, source) {
 
     // === Create payload for valid logs only ===
     const payload = validLogs.map(log => ({
+      tenantId: TENANT_ID,
       deviceSN: DEVICE_SN,
       employeeCode: log.userId || log.user_id,
       punchTime: log.attTime || log.record_time,
