@@ -1,208 +1,365 @@
-
-
 require('dotenv').config();
 const Zkteco = require('zkteco-js');
 const axios = require('axios');
 const express = require('express');
 const cron = require('node-cron');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
+app.use(express.json());
 
-const DEVICE_IP = process.env.DEVICE_IP;
 const CLOUD_URL = process.env.CLOUD_URL;
 const TENANT_ID = process.env.TENANT_ID;
 const GATEWAY_TOKEN = process.env.GATEWAY_TOKEN;
-const DEVICE_SN = process.env.DEVICE_SN;
+const DEVICES_API_URL = process.env.DEVICES_API_URL || `${CLOUD_URL}/service/api/devices/${TENANT_ID}`;
+const DEVICE_IP = process.env.DEVICE_IP;
 
-let device;
-let isConnected = false;
+// ---------- Local storage for last sync ----------
+const DATA_DIR = path.join(__dirname, 'data');
+const SYNC_STATE_FILE = path.join(DATA_DIR, 'sync-state.json');
 
-console.log(`🚀 Gateway starting... Targeting device: ${DEVICE_IP}`);
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
-async function connectToDevice() {
-  // Correct parameters for SilkBio-101TC
-  device = new Zkteco(DEVICE_IP, 4370, 15000, 0);   // timeout + password=0
+function loadSyncState() {
+  try {
+    if (fs.existsSync(SYNC_STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(SYNC_STATE_FILE, 'utf8'));
+    }
+  } catch (err) {
+    console.error('⚠️ Failed to load sync-state.json:', err.message);
+  }
+  return {};
+}
 
+function saveSyncState(state) {
+  try {
+    fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(state, null, 2));
+  } catch (err) {
+    console.error('❌ Failed to save sync-state.json:', err.message);
+  }
+}
 
+let syncState = loadSyncState(); // { [deviceSN]: { lastPunchTime: "ISO string", updatedAt: "..." } }
+
+// ---------- Device runtime state ----------
+const deviceMap = new Map();
+
+console.log('🚀 Multi-device Gateway starting...');
+console.log(`📡 Cloud URL: ${CLOUD_URL}`);
+console.log(`📟 Devices API: ${DEVICES_API_URL}`);
+
+// ---------- Fetch devices from your backend ----------
+async function fetchDevicesFromAPI() {
+  try {
+    const res = await axios.get(DEVICES_API_URL, {
+      headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
+      timeout: 15000,
+      params: { tenantId: TENANT_ID }
+    });
+
+    console.log("res devices", res.data);
+
+    const devices = res.data.devices || res.data || [];
+
+    console.log(`📥 Received ${devices.length} device(s) from API`);
+    return devices.map(d => ({
+      ip: d.ipAddress || d.deviceIp,
+      sn: d.deviceSerialNumber || d.deviceSN || d.serialNumber,
+      port: d.port || 4370,
+      password: d.password ?? 0,
+      device_id: d.id
+    })).filter(d => d.ip && d.sn);
+
+  } catch (err) {
+    console.error('❌ Failed to fetch devices from API:', err.message);
+    return [];
+  }
+}
+
+// ---------- Connection management ----------
+async function connectToDevice(config) {
+  const { ip, sn, port = 4370, password = 0, timeout = 15000, device_id } = config;
+
+  console.log("config", config);
+  
+
+  if (deviceMap.has(ip) && deviceMap.get(ip).connecting) return;
+
+  const entry = deviceMap.get(ip) || { isConnected: false, sn, config };
+  entry.connecting = true;
+  entry.sn = sn;
+  entry.config = config;
+  deviceMap.set(ip, entry);
 
   try {
-    console.log(`🔌 Attempting connection to ${DEVICE_IP}:4370 ...`);
+    console.log(`🔌 Connecting → ${ip}:${port} (SN: ${sn})`);
+
+    const device = new Zkteco(ip, port, timeout, password);
     await device.createSocket();
-    await new Promise(r => setTimeout(r, 2000));   // extra delay for ESSL
+    await new Promise(r => setTimeout(r, 1500));
 
-    isConnected = true;
+    console.log("entry", entry);
+    
 
-    // console.log("device", device);
+    entry.device = device;
+    entry.isConnected = true;
+    entry.connecting = false;
+    entry.lastError = null;
+    entry.lastConnectedAt = new Date();
+    deviceMap.set(ip, entry);
 
-    console.log(`✅ SUCCESS: Connected to SilkBio-101TC at ${DEVICE_IP}`);
-
-    const name = await device.getDeviceName();
-
-    // console.log("name", name);
-
+    console.log(`✅ Connected → ${ip} (SN: ${sn})`);
 
     // Real-time listener
     await device.getRealTimeLogs(async (log) => {
-      console.log('📍 Real-time punch received:', log);
-      // await sendToCloud(log, 'real-time');
+      console.log(`📍 [${sn}] Real-time:`, log?.user_id || log?.userId, log?.attTime || log?.record_time);
+      await processAndSendLogs([log], 'real-time', sn, device_id);
     });
 
   } catch (err) {
-    isConnected = false;
-    console.error(`❌ Connection failed to ${DEVICE_IP}:4370`);
-    console.error(`   Full Error:`, err);
-    console.error(`   Hint: Make sure ADMS/Cloud Server is OFF on the device`);
-    setTimeout(connectToDevice, 10000);
+    entry.isConnected = false;
+    entry.connecting = false;
+    entry.lastError = err.message;
+    deviceMap.set(ip, entry);
+
+    console.error(`❌ Connect failed ${ip}: ${err.message}`);
+    setTimeout(() => connectToDevice(config), 12000);
   }
 }
 
+async function disconnectDevice(ip) {
+  const entry = deviceMap.get(ip);
+  if (!entry) return;
 
+  try {
+    if (entry.device && typeof entry.device.disconnect === 'function') {
+      await entry.device.disconnect();
+    }
+  } catch (_) {}
 
+  deviceMap.delete(ip);
+  console.log(`🔌 Disconnected device ${ip}`);
+}
 
-async function sendToCloud(logs, source) {
+// ---------- Core: process + filter + BATCH send (100 records) ----------
+async function processAndSendLogs(logs, source, deviceSN, device_id) {
   if (!logs || logs.length === 0) return;
 
-  try {
-    // Convert single log to array if needed
-    const logArray = Array.isArray(logs) ? logs : [logs];
+  const logArray = Array.isArray(logs) ? logs : [logs];
 
-    // === FILTER OUT EMPTY USER_ID LOGS ===
-    const validLogs = logArray.filter(log => {
-      const userId = log.userId || log.user_id;
+  // 1. Filter empty user_id
+  let validLogs = logArray.filter(log => {
+    const userId = log.userId || log.user_id;
+    return userId && userId.toString().trim() !== '';
+  });
 
-      // Skip if userId is empty, null, undefined, or empty string
-      if (!userId || userId.toString().trim() === "") {
-        console.log("⛔ Skipped log with empty user_id:", log);
-        return false;
-      }
-      return true;
+  if (validLogs.length === 0) return;
+
+  // 2. Filter by last known punch time (incremental)
+  const lastInfo = syncState[deviceSN];
+  if (lastInfo?.lastPunchTime) {
+    const lastTime = new Date(lastInfo.lastPunchTime).getTime();
+
+    console.log("lastTime", lastTime);
+    
+
+    validLogs = validLogs.filter(log => {
+      console.log("any", log);
+      
+      const punchTime = new Date(log.attTime || log.record_time).getTime();
+      return punchTime > lastTime;
     });
+  }
 
-    if (validLogs.length === 0) {
-      console.log("⚠️ All logs had empty user_id. Nothing to send.");
-      return;
-    }
+  if (validLogs.length === 0) {
+    console.log(`⏭️  [${deviceSN}] No new logs after last sync (${lastInfo?.lastPunchTime || 'none'})`);
+    return;
+  }
 
-    if (validLogs.length < logArray.length) {
-      console.log(`🔍 Skipped ${logArray.length - validLogs.length} logs with empty user_id`);
-    }
+  // 3. Sort by punch time ascending (very important)
+  validLogs.sort((a, b) => {
+    const t1 = new Date(a.attTime || a.record_time).getTime();
+    const t2 = new Date(b.attTime || b.record_time).getTime();
+    return t1 - t2;
+  });
+////
+  console.log(`📤 [${deviceSN}] Preparing to send ${validLogs.length} new log(s) in batches of 100...`);
 
-    // === Create payload for valid logs only ===
-    const payload = validLogs.map(log => ({
+  // 4. Send in batches of 100
+  const BATCH_SIZE = 100;
+  let totalSent = 0;
+
+  for (let i = 0; i < validLogs.length; i += BATCH_SIZE) {
+    const batch = validLogs.slice(i, i + BATCH_SIZE);
+
+    const payload = batch.map(log => ({
       tenantId: TENANT_ID,
-      deviceSN: DEVICE_SN,
+      deviceSN,
       employeeCode: log.userId || log.user_id,
       punchTime: log.attTime || log.record_time,
-      verifyMode: log.verifyMode || log.state,
-      inOutStatus: log.inOutMode || log.type,
-      source: source
+      verifyMode: log.verifyMode || log.type,
+      inOutStatus: log.inOutMode || log.state,
+      source,
+      deviceId: device_id,
     }));
 
-    // Send batch to cloud
-    await axios.post(`${CLOUD_URL}/service/api/attendance/push`, {
-      logs: payload
-    }, {
-      headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
-      timeout: 15000
-    });
+    console.log("payload", payload);
+    
 
-    console.log(`✅ Successfully sent ${payload.length} valid logs to cloud`);
+    try {
+      await axios.post(`${CLOUD_URL}/service/api/attendance/push`, {
+        logs: payload
+      }, {
+        headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
+        timeout: 30000
+      });
 
-  } catch (err) {
-    console.error('❌ Cloud batch push failed:', err.message);
-  }
-}
+      totalSent += batch.length;
+      console.log(`✅ [${deviceSN}] Batch sent: ${batch.length} records (Total: ${totalSent}/${validLogs.length})`);
 
+      // Update lastPunchTime after every successful batch
+      const newestInBatch = batch.reduce((latest, log) => {
+        const t = new Date(log.attTime || log.record_time).getTime();
+        return t > latest ? t : latest;
+      }, 0);
 
-async function fullHistoricalSync() {
-  if (!isConnected) return console.warn('⚠️ Device not connected. Skipping sync.');
+      if (newestInBatch > 0) {
+        syncState[deviceSN] = {
+          lastPunchTime: new Date(newestInBatch).toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+        saveSyncState(syncState);
+      }
 
-  console.log('🔄 Pulling ALL historical logs...');
-  try {
-    const result = await device.getAttendances();
-    const logs = result.data || result;
+      // Small delay between batches (prevents overwhelming the server)
+      if (i + BATCH_SIZE < validLogs.length) {
+        await new Promise(r => setTimeout(r, 300));
+      }
 
-    console.log(`📦 Fetched ${logs.length} logs from device`);
+    } catch (err) {
+      console.error(`❌ [${deviceSN}] Batch failed (${batch.length} records):`, err.message);
 
-    // Send in batches of 100 (adjust as needed)
-    const BATCH_SIZE = 100;
-    for (let i = 0; i < logs.length; i += BATCH_SIZE) {
-      const batch = logs.slice(i, i + BATCH_SIZE);
-      await sendToCloud(batch, 'historical');
+      // Stop further batches on error.
+      // Next run will continue from the last successfully saved punch time.
+      break;
     }
+  }
 
-    console.log('✅ Historical sync completed (batched)');
-  } catch (err) {
-    console.error('❌ Historical sync failed:', err.message);
+  if (totalSent > 0) {
+    console.log(`🎉 [${deviceSN}] Successfully pushed ${totalSent} log(s)`);
   }
 }
 
+// ---------- Historical sync ----------
+async function fullHistoricalSync(targetIp = null) {
+  const entries = targetIp
+    ? [deviceMap.get(targetIp)].filter(Boolean)
+    : Array.from(deviceMap.values());
 
-// async function sendToCloud(log, source) {
-//   try {
-//     console.log("log", log);
-//     console.log("source", source);
+  for (const entry of entries) {
+    if (!entry?.isConnected || !entry.device) continue;
 
-//     await axios.post(`${CLOUD_URL}/service/api/attendance/push`, {
-//       tenantId: TENANT_ID,
-//       deviceSN: DEVICE_SN,
-//       employeeCode: log.user_id,
-//       punchTime: log.record_time,
-//       verifyMode: log.state,
-//       inOutStatus: log.type,
-//       source: source
-//     }, {
-//       headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
-//       timeout: 10000
-//     });
-//   } catch (err) {
-//     console.error('❌ Cloud push failed:', err.message);
-//   }
-// }
+    console.log("entry aaa", entry);
+    
 
-// async function fullHistoricalSync() {
-//   if (!isConnected) return console.warn('⚠️ Device not connected. Skipping sync.');
+    const { device, sn } = entry;
 
-//   console.log('🔄 Pulling ALL historical logs...');
-//   try {
-//     const result = await device.getAttendances();
-//     const logs = result.data || result;
-//     console.log(`📦 Fetched ${logs.length} logs`);
+    try {
+      console.log(`🔄 [${sn}] Pulling logs...`);
+      const result = await device.getAttendances();
+      const logs = result.data || result || [];
 
-//     console.log("logs", logs);
+      console.log(`📦 [${sn}] Device returned ${logs.length} total logs`);
+      await processAndSendLogs(logs, 'historical', sn, entry.config.device_id);
 
-//     console.log("last", logs[0]);
+    } catch (err) {
+      console.error(`❌ [${sn}] Historical pull failed:`, err.message);
+    }
+  }
+}
 
-//     const filteredLogs = logs?.filter((log) => {
-//       if (log?.user_id) {
-//         return log
-//       }
-//     });
+// ---------- Sync device list with API ----------
+async function syncDeviceList() {
+  const apiDevices = await fetchDevicesFromAPI();
+  console.log("apiDevices", apiDevices);
 
-//     console.log("filteredLogs", filteredLogs);
-//     await sendToCloud(logs[0], 'historical');
+  const apiIps = new Set(apiDevices.map(d => d.ip));
 
-//     // for (const log of logs) {
-//     // await sendToCloud(log, 'historical');
-//     // }
-//     console.log('✅ Historical sync completed');
-//   } catch (err) {
-//     console.error('❌ Historical sync failed:', err.message);
-//   }
-// }
+  // Connect new devices
+  for (const config of apiDevices) {
+    if (!deviceMap.has(config.ip) || !deviceMap.get(config.ip).isConnected) {
+      connectToDevice(config);
+    }
+  }
 
+  // Disconnect removed devices
+  for (const [ip] of deviceMap) {
+    if (!apiIps.has(ip)) {
+      console.log(`🗑️  Device ${ip} removed from API → disconnecting`);
+      await disconnectDevice(ip);
+    }
+  }
+}
 
+// ---------- Routes ----------
+app.get('/health', (req, res) => {
+  const devices = Array.from(deviceMap.entries()).map(([ip, e]) => ({
+    ip,
+    sn: e.sn,
+    connected: e.isConnected,
+    lastConnectedAt: e.lastConnectedAt,
+    lastError: e.lastError,
+    lastPunchTime: syncState[e.sn]?.lastPunchTime || null
+  }));
 
-// API routes
-app.post('/sync-full', (req, res) => { fullHistoricalSync(); res.json({ status: 'started' }); });
-app.get('/health', (req, res) => res.json({ status: 'ok', connected: isConnected, deviceIP: DEVICE_IP }));
+  res.json({
+    status: 'ok',
+    connectedCount: devices.filter(d => d.connected).length,
+    totalTracked: devices.length,
+    devices
+  });
+});
 
-// Start
-connectToDevice();
-setTimeout(fullHistoricalSync, 20000);
-cron.schedule('*/30 * * * *', fullHistoricalSync);
+app.post('/sync-full', (req, res) => {
+  fullHistoricalSync();
+  res.json({ status: 'started' });
+});
+
+app.post('/sync-full/:ip', (req, res) => {
+  fullHistoricalSync(req.params.ip);
+  res.json({ status: 'started', ip: req.params.ip });
+});
+
+app.get('/sync-state', (req, res) => {
+  res.json(syncState);
+});
+
+app.delete('/sync-state/:sn', (req, res) => {
+  delete syncState[req.params.sn];
+  saveSyncState(syncState);
+  res.json({ status: 'cleared', sn: req.params.sn });
+});
+
+// ---------- Boot ----------
+(async () => {
+  await syncDeviceList();
+
+  // Refresh device list every 5 minutes
+  setInterval(syncDeviceList, 5 * 60 * 1000);
+
+  // Initial historical after devices connect
+  setTimeout(() => fullHistoricalSync(), 20000);
+
+  // Periodic historical every 30 minutes
+  cron.schedule('*/30 * * * *', () => {
+    console.log('⏰ Cron historical sync');
+    fullHistoricalSync();
+  });
+})();
 
 app.listen(5005, () => {
   console.log('🚀 Gateway running on port 5005');
-  console.log(`📡 Cloud URL: ${CLOUD_URL}`);
 });

@@ -4,9 +4,11 @@ services:
   essl-gateway:
     build: .
     container_name: essl-gateway
-    restart: unless-stopped          # ← This is the key line
+    restart: unless-stopped
     env_file: .env
-    network_mode: host               # Important for local network access to device
+    network_mode: host               # Keep this (needed for local biometric devices)
+    volumes:
+      - ./data:/app/data             # ← Add this
     logging:
       driver: "json-file"
       options:
