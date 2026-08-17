@@ -11,9 +11,8 @@ app.use(express.json());
 
 const CLOUD_URL = process.env.CLOUD_URL;
 const TENANT_ID = process.env.TENANT_ID;
-const ACCESS_KEY = process.env.ACCESS_KEY;
 const GATEWAY_TOKEN = process.env.GATEWAY_TOKEN;
-const DEVICES_API_URL = process.env.DEVICES_API_URL || `${CLOUD_URL}/service/api/devices/${TENANT_ID}/${ACCESS_KEY}`;
+const DEVICES_API_URL = process.env.DEVICES_API_URL || `${CLOUD_URL}/service/api/devices/${TENANT_ID}`;
 const DEVICE_IP = process.env.DEVICE_IP;
 
 // ---------- Local storage for last sync ----------
@@ -79,7 +78,7 @@ async function fetchDevicesFromAPI() {
       port: d.port || 4370,
       password: d.password ?? 0,
       device_id: d.id,
-      logsCount: d.logsCount ?? null
+      logsCount: d.logsCount ?? null          // ← added
     })).filter(d => d.ip && d.sn);
 
   } catch (err) {
@@ -185,21 +184,10 @@ async function processAndSendLogs(logs, source, deviceSN, device_id, logsCount =
   if (logsCount != null && lastInfo?.lastSN != null) {
     const lastSN = Number(lastInfo.lastSN);
 
-    // validLogs = validLogs.filter(log => {
-    //   const currentSN = Number(log.sn);
-    //   return !isNaN(currentSN) && currentSN > lastSN;
-    // });
-
-    const filteredLogs = [];
-    for (const log of validLogs) {
+    validLogs = validLogs.filter(log => {
       const currentSN = Number(log.sn);
-
-      if (!isNaN(currentSN) && currentSN > lastSN) {
-        filteredLogs.push(log);
-      }
-    }
-
-    validLogs = filteredLogs;
+      return !isNaN(currentSN) && currentSN > lastSN;
+    });
 
     if (validLogs.length === 0) {
       console.log(`⏭️  [${deviceSN}] No new logs after last SN (${lastInfo.lastSN})`);
@@ -210,20 +198,7 @@ async function processAndSendLogs(logs, source, deviceSN, device_id, logsCount =
   }
 
   // 3. Sort by SN ascending
-  // validLogs.sort((a, b) => Number(a.sn) - Number(b.sn));
-  for (let i = 1; i < validLogs.length; i++) {
-    const current = validLogs[i];
-    const currentSn = Number(current.sn);
-
-    let j = i - 1;
-
-    while (j >= 0 && Number(validLogs[j].sn) > currentSn) {
-      validLogs[j + 1] = validLogs[j];
-      j--;
-    }
-
-    validLogs[j + 1] = current;
-  }
+  validLogs.sort((a, b) => Number(a.sn) - Number(b.sn));
 
   console.log(`📤 [${deviceSN}] Preparing to send ${validLogs.length} log(s) in batches of 100...`);
 
@@ -246,18 +221,9 @@ async function processAndSendLogs(logs, source, deviceSN, device_id, logsCount =
       sn: log.sn,
     }));
 
-    const lastLogIndex = payload.length - 1;
-
     try {
       await axios.post(`${CLOUD_URL}/service/api/attendance/push`, {
         logs: payload
-      }, {
-        headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
-        timeout: 30000
-      });
-
-     await axios.put(`${CLOUD_URL}/service/api/update/logsCount`, {
-        logsCount: payload[lastLogIndex].sn, deviceId: device_id
       }, {
         headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
         timeout: 30000
