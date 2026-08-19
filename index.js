@@ -231,6 +231,7 @@ async function processAndSendLogs(logs, source, deviceSN, device_id, logsCount =
   const BATCH_SIZE = 100;
   let totalSent = 0;
 
+
   for (let i = 0; i < validLogs.length; i += BATCH_SIZE) {
     const batch = validLogs.slice(i, i + BATCH_SIZE);
 
@@ -238,13 +239,16 @@ async function processAndSendLogs(logs, source, deviceSN, device_id, logsCount =
       tenantId: TENANT_ID,
       deviceSN,
       employeeCode: log.userId || log.user_id,
-      punchTime: log.attTime || log.record_time,
+      punchTime: formatDate(log.attTime || log.record_time) ,
       verifyMode: log.verifyMode || log.type,
       inOutStatus: log.inOutMode || log.state,
       source,
       deviceId: device_id,
       sn: log.sn,
     }));
+
+    console.log("payload", payload);
+    
 
     const lastLogIndex = payload.length - 1;
 
@@ -405,6 +409,20 @@ app.delete('/sync-state/:sn', (req, res) => {
 app.listen(5005, () => {
   console.log('🚀 Gateway running on port 5005');
 });
+
+function formatDate(dateString) {
+  const date = new Date(dateString);
+
+  const pad = (num) => String(num).padStart(2, '0');
+
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+         `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+// const input = "Wed Aug 19 2026 13:19:14 GMT+0530 (India Standard Time)";
+
+// console.log(formatDate(input));
+// 2026-08-19 13:19:14
 
 
 // async function processAndSendLogs(logs, source, deviceSN, device_id) {
